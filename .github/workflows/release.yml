@@ -1,373 +1,208 @@
-name: Plexo Release
+name: Build and Release Plexo
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Release tag, for example v1.0.0 or v1.0.0-rc.11"
-        required: true
-        type: string
-
-      source_ref:
-        description: "Branch, tag, or commit to build from"
-        required: true
-        default: "main"
-        type: string
 
 permissions:
   contents: write
 
-concurrency:
-  group: plexo-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-  cancel-in-progress: false
-
+env:
+  NODE_VERSION: "22.13.0"
+  REPOSITORY: "ProAlit/plexo"
 
 jobs:
-
-  # ============================================================
-  # BUILD
-  # ============================================================
-
   build:
-    name: Build ${{ matrix.platform }}
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
-
       matrix:
         include:
-
-          - platform: Windows
-            os: windows-latest
+          - name: Windows
+            os: windows-2025
             target: win
-            artifact_name: plexo-windows
-            output_dir: release/windows
 
-          - platform: macOS
-            os: macos-latest
+          - name: macOS
+            os: macos-26
             target: mac
-            artifact_name: plexo-macos
-            output_dir: release/macos
 
-          - platform: Linux
-            os: ubuntu-latest
+          - name: Linux
+            os: ubuntu-24.04
             target: linux
-            artifact_name: plexo-linux
-            output_dir: release/linux
-
 
     steps:
-
-      # ----------------------------------------------------------
-      # CHECKOUT
-      # ----------------------------------------------------------
-
-      - name: Checkout source
-        uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
           fetch-depth: 0
 
-
-      # ----------------------------------------------------------
-      # NODE
-      # ----------------------------------------------------------
-
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
-          node-version: "22.13.0"
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
+      - name: Show package version
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
 
-      # ----------------------------------------------------------
-      # INSTALL
-      # ----------------------------------------------------------
+          echo "Package version: ${VERSION}"
+          echo "Automatic release tag: v${VERSION}"
+
+          {
+            echo "VERSION=${VERSION}"
+            echo "TAG=v${VERSION}"
+          } >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: npm ci
 
-
-      # ----------------------------------------------------------
-      # PACKAGE VERSION
-      # ----------------------------------------------------------
-
-      - name: Read package version
+      - name: Clean previous build
         shell: bash
         run: |
-          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          node <<'NODE'
+          const fs = require('fs');
 
-          echo "Package version: ${PACKAGE_VERSION}"
+          for (const dir of ['dist', 'release']) {
+            fs.rmSync(dir, {
+              recursive: true,
+              force: true
+            });
+          }
 
-          if [ -z "${PACKAGE_VERSION}" ]; then
-            echo "ERROR: Could not determine package version."
-            exit 1
-          fi
+          fs.mkdirSync('release', {
+            recursive: true
+          });
+          NODE
 
-          echo "PACKAGE_VERSION=${PACKAGE_VERSION}" >> "$GITHUB_ENV"
-
-
-      # ----------------------------------------------------------
-      # CLEAN
-      # ----------------------------------------------------------
-
-      - name: Clean build directories
-        shell: bash
-        run: |
-          rm -rf dist
-          rm -rf release
-
-          mkdir -p "${{ matrix.output_dir }}"
-
-
-      # ----------------------------------------------------------
-      # BUILD
-      # ----------------------------------------------------------
-
-      - name: Build ${{ matrix.platform }}
+      - name: Build ${{ matrix.target }}
         run: npm run build:${{ matrix.target }}
 
-
-      # ----------------------------------------------------------
-      # SHOW BUILD OUTPUT
-      #
-      # IMPORTANT:
-      # Do not use GNU find -printf here.
-      # macOS uses BSD find.
-      # ----------------------------------------------------------
-
-      - name: Show build output
+      - name: Collect release files
         shell: bash
         run: |
-          echo "========================================"
-          echo "Build output"
-          echo "========================================"
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
 
-          find dist \
-            -maxdepth 1 \
-            -type f \
-            -print \
-            | sort || true
+          const dist = path.resolve('dist');
+          const release = path.resolve('release');
 
+          const allowed = /\.(dmg|pkg|exe|msi|appimage|deb|rpm|snap|pacman|zip|7z|tar\.gz|blockmap|yml|yaml|zsync|sig)$/i;
 
-      # ----------------------------------------------------------
-      # COLLECT ONLY DISTRIBUTABLE FILES
-      # ----------------------------------------------------------
+          if (!fs.existsSync(dist)) {
+            throw new Error('dist directory does not exist.');
+          }
 
-      - name: Collect release assets
+          fs.mkdirSync(release, { recursive: true });
+
+          const files = fs.readdirSync(dist, { withFileTypes: true })
+            .filter(entry => entry.isFile())
+            .map(entry => entry.name)
+            .filter(name => allowed.test(name))
+            .sort();
+
+          if (files.length === 0) {
+            throw new Error(
+              'No packaged release files were found in dist/.'
+            );
+          }
+
+          for (const file of files) {
+            fs.copyFileSync(
+              path.join(dist, file),
+              path.join(release, file)
+            );
+          }
+
+          console.log('Release files:');
+          for (const file of files) {
+            console.log(`  ${file}`);
+          }
+          NODE
+
+      - name: Verify release files
         shell: bash
         run: |
-          echo "========================================"
-          echo "Collecting distributables"
-          echo "========================================"
+          echo "Collected files:"
+          ls -lah release
 
-          find dist \
-            -maxdepth 1 \
-            -type f \
-            \( \
-              -name "*.exe" \
-              -o -name "*.exe.blockmap" \
-              -o -name "*.msi" \
-              -o -name "*.msi.blockmap" \
-              -o -name "*.appx" \
-              -o -name "*.appx.blockmap" \
-              -o -name "*.dmg" \
-              -o -name "*.dmg.blockmap" \
-              -o -name "*.pkg" \
-              -o -name "*.zip" \
-              -o -name "*.zip.blockmap" \
-              -o -name "*.7z" \
-              -o -name "*.7z.blockmap" \
-              -o -name "*.AppImage" \
-              -o -name "*.deb" \
-              -o -name "*.rpm" \
-              -o -name "*.snap" \
-              -o -name "*.pacman" \
-              -o -name "*.apk" \
-              -o -name "*.p5p" \
-              -o -name "*.tar.gz" \
-              -o -name "*.tar.xz" \
-              -o -name "*.tar.bz2" \
-              -o -name "*.tar.zst" \
-              -o -name "*.blockmap" \
-              -o -name "*.yml" \
-            \) \
-            ! -name "builder-debug.yml" \
-            ! -name "builder-effective-config.yaml" \
-            -exec cp {} "${{ matrix.output_dir }}/" \;
+          count="$(find release -maxdepth 1 -type f | wc -l)"
 
-
-      # ----------------------------------------------------------
-      # VERIFY RELEASE ASSETS
-      # ----------------------------------------------------------
-
-      - name: Verify release assets
-        shell: bash
-        run: |
-          echo "========================================"
-          echo "Release assets for ${{ matrix.platform }}"
-          echo "========================================"
-
-          find "${{ matrix.output_dir }}" \
-            -maxdepth 1 \
-            -type f \
-            -print \
-            | sort
-
-          COUNT=$(find "${{ matrix.output_dir }}" \
-            -maxdepth 1 \
-            -type f \
-            | wc -l \
-            | tr -d ' ')
-
-          echo
-          echo "Asset count: ${COUNT}"
-
-          if [ "${COUNT}" -eq 0 ]; then
-            echo
-            echo "ERROR: No distributable release assets were found."
-            echo
-            echo "Full dist directory:"
-            find dist -maxdepth 2 -type f -print
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: No release files found."
             exit 1
           fi
 
+          echo "Total release files: ${count}"
 
-      # ----------------------------------------------------------
-      # UPLOAD CLEAN ARTIFACT
-      # ----------------------------------------------------------
-
-      - name: Upload ${{ matrix.platform }} release
-        uses: actions/upload-artifact@v7
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.output_dir }}/*
+          name: plexo-${{ matrix.name }}-${{ github.sha }}
+          path: release/*
           if-no-files-found: error
-          compression-level: 0
-          retention-days: 3
-
-
-  # ============================================================
-  # RELEASE
-  # ============================================================
+          retention-days: 7
 
   release:
-    name: Publish GitHub Release
+    name: Create GitHub Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
-
-      # ----------------------------------------------------------
-      # CHECKOUT
-      # ----------------------------------------------------------
-
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
           fetch-depth: 0
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-      # ----------------------------------------------------------
-      # DETERMINE TAG
-      # ----------------------------------------------------------
-
-      - name: Determine release tag
-        id: release
+      - name: Determine version and automatic tag
+        id: version
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.release_tag }}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-          fi
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="v${VERSION}"
 
-          echo "Release tag: ${TAG}"
-
-          if [ -z "${TAG}" ]; then
-            echo "ERROR: Release tag is empty."
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Could not read version from package.json."
             exit 1
           fi
 
-          case "${TAG}" in
-            v*)
-              ;;
-            *)
-              echo "ERROR: Release tag must start with 'v'."
-              echo "Example: v1.0.0 or v1.0.0-rc.11"
-              exit 1
-              ;;
-          esac
+          echo "Package version : ${VERSION}"
+          echo "Release tag     : ${TAG}"
 
-          VERSION="${TAG#v}"
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
 
-          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].+)?$ ]]; then
-            echo "ERROR: Invalid semantic version:"
-            echo "${TAG}"
-            exit 1
-          fi
-
-          PACKAGE_VERSION=$(node -p "require('./package.json').version")
-
-          echo "Package version: ${PACKAGE_VERSION}"
-          echo "Release version: ${VERSION}"
-
-          if [ "${PACKAGE_VERSION}" != "${VERSION}" ]; then
-            echo
-            echo "ERROR: Release tag does not match package.json."
-            echo
-            echo "package.json : ${PACKAGE_VERSION}"
-            echo "release tag   : ${VERSION}"
-            echo
-            exit 1
-          fi
-
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-
-      # ----------------------------------------------------------
-      # DOWNLOAD WINDOWS
-      # ----------------------------------------------------------
-
-      - name: Download Windows release
-        uses: actions/download-artifact@v8
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
         with:
-          name: plexo-windows
-          path: downloaded/windows
+          name: plexo-Windows-${{ github.sha }}
+          path: artifacts/windows
 
-
-      # ----------------------------------------------------------
-      # DOWNLOAD MACOS
-      # ----------------------------------------------------------
-
-      - name: Download macOS release
-        uses: actions/download-artifact@v8
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
         with:
-          name: plexo-macos
-          path: downloaded/macos
+          name: plexo-macOS-${{ github.sha }}
+          path: artifacts/macos
 
-
-      # ----------------------------------------------------------
-      # DOWNLOAD LINUX
-      # ----------------------------------------------------------
-
-      - name: Download Linux release
-        uses: actions/download-artifact@v8
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
         with:
-          name: plexo-linux
-          path: downloaded/linux
-
-
-      # ----------------------------------------------------------
-      # PREPARE FINAL RELEASE ASSETS
-      # ----------------------------------------------------------
+          name: plexo-Linux-${{ github.sha }}
+          path: artifacts/linux
 
       - name: Prepare release assets
         shell: bash
@@ -375,161 +210,85 @@ jobs:
           rm -rf upload
           mkdir -p upload
 
-          echo "========================================"
-          echo "Windows assets"
-          echo "========================================"
+          cp artifacts/windows/* upload/ 2>/dev/null || true
+          cp artifacts/macos/* upload/2>/dev/null || true
+          cp artifacts/linux/* upload/2>/dev/null || true
 
-          find downloaded/windows \
-            -maxdepth 1 \
-            -type f \
-            -print \
-            | sort || true
+          echo "Final release assets:"
+          ls -lah upload
 
-          echo
-          echo "========================================"
-          echo "macOS assets"
-          echo "========================================"
+          shopt -s nullglob
+          files=(upload/*)
 
-          find downloaded/macos \
-            -maxdepth 1 \
-            -type f \
-            -print \
-            | sort || true
-
-          echo
-          echo "========================================"
-          echo "Linux assets"
-          echo "========================================"
-
-          find downloaded/linux \
-            -maxdepth 1 \
-            -type f \
-            -print \
-            | sort || true
-
-
-          # ------------------------------------------------------
-          # Copy only distributables
-          # ------------------------------------------------------
-
-          find downloaded \
-            -type f \
-            \( \
-              -name "*.exe" \
-              -o -name "*.exe.blockmap" \
-              -o -name "*.msi" \
-              -o -name "*.msi.blockmap" \
-              -o -name "*.appx" \
-              -o -name "*.appx.blockmap" \
-              -o -name "*.dmg" \
-              -o -name "*.dmg.blockmap" \
-              -o -name "*.pkg" \
-              -o -name "*.zip" \
-              -o -name "*.zip.blockmap" \
-              -o -name "*.7z" \
-              -o -name "*.7z.blockmap" \
-              -o -name "*.AppImage" \
-              -o -name "*.deb" \
-              -o -name "*.rpm" \
-              -o -name "*.snap" \
-              -o -name "*.pacman" \
-              -o -name "*.apk" \
-              -o -name "*.p5p" \
-              -o -name "*.tar.gz" \
-              -o -name "*.tar.xz" \
-              -o -name "*.tar.bz2" \
-              -o -name "*.tar.zst" \
-              -o -name "*.blockmap" \
-              -o -name "*.yml" \
-            \) \
-            ! -name "builder-debug.yml" \
-            ! -name "builder-effective-config.yaml" \
-            -exec cp {} upload/ \;
-
-
-      # ----------------------------------------------------------
-      # VERIFY FINAL RELEASE
-      # ----------------------------------------------------------
-
-      - name: Verify final release assets
-        shell: bash
-        run: |
-          echo "========================================"
-          echo "Final GitHub Release assets"
-          echo "========================================"
-
-          find upload \
-            -maxdepth 1 \
-            -type f \
-            -print \
-            | sort
-
-          COUNT=$(find upload \
-            -maxdepth 1 \
-            -type f \
-            | wc -l \
-            | tr -d ' ')
-
-          echo
-          echo "Final asset count: ${COUNT}"
-
-          if [ "${COUNT}" -eq 0 ]; then
-            echo "ERROR: No release assets found."
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "ERROR: No release assets were collected."
             exit 1
           fi
 
-
-      # ----------------------------------------------------------
-      # RELEASE TYPE
-      # ----------------------------------------------------------
-
-      - name: Determine release type
-        id: release_type
-        shell: bash
-        run: |
-          TAG="${{ steps.release.outputs.tag }}"
-
-          if [[ "${TAG}" =~ -(alpha|beta|rc)(\.|-|$) ]]; then
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "Release type: prerelease"
-          else
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "Release type: stable"
-          fi
-
-
-      # ----------------------------------------------------------
-      # PUBLISH RELEASE
-      # ----------------------------------------------------------
-
-      - name: Publish GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.release.outputs.tag }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET_SHA: ${{ github.sha }}
         shell: bash
         run: |
+          set -euo pipefail
+
           echo "========================================"
-          echo "Publishing Plexo ${TAG}"
+          echo "Plexo automatic release"
+          echo "========================================"
+          echo "Package version : ${VERSION}"
+          echo "Release tag     : ${TAG}"
+          echo "Commit          : ${TARGET_SHA}"
           echo "========================================"
 
-          if [ "${{ steps.release_type.outputs.prerelease }}" = "true" ]; then
-            gh release create "${TAG}" \
-              upload/* \
-              --repo "ProAlit/plexo" \
+          shopt -s nullglob
+          ASSETS=(upload/*)
+
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "ERROR: No assets found."
+            exit 1
+          fi
+
+          # Determine whether this is a prerelease.
+          PRERELEASE_ARGS=()
+
+          case "${VERSION}" in
+            *-alpha*|*-beta*|*-rc*)
+              PRERELEASE_ARGS+=(--prerelease)
+              echo "Release type    : PRE-RELEASE"
+              ;;
+            *)
+              echo "Release type    : STABLE"
+              ;;
+          esac
+
+          # If the release already exists, upload/replace its assets.
+          if gh release view "${TAG}" --repo "${REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists."
+            echo "Updating existing release assets..."
+
+            gh release upload \
+              "${TAG}" \
+              "${ASSETS[@]}" \
+              --repo "${REPOSITORY}" \
+              --clobber
+
+          else
+            echo "Release ${TAG} does not exist."
+            echo "Creating release..."
+
+            gh release create \
+              "${TAG}" \
+              "${ASSETS[@]}" \
+              --repo "${REPOSITORY}" \
+              --target "${TARGET_SHA}" \
               --title "Plexo ${TAG}" \
               --generate-notes \
-              --prerelease
-          else
-            gh release create "${TAG}" \
-              upload/* \
-              --repo "ProAlit/plexo" \
-              --title "Plexo ${TAG}" \
-              --generate-notes
+              "${PRERELEASE_ARGS[@]}"
           fi
 
           echo
-          echo "========================================"
-          echo "Release published successfully"
-          echo "========================================"
-
-          echo "https://github.com/ProAlit/plexo/releases/tag/${TAG}"
+          echo "Release completed successfully:"
+          echo "https://github.com/${REPOSITORY}/releases/tag/${TAG}"
