@@ -1,121 +1,555 @@
-name: Build and Release Plexo
+name: Plexo Release
 
 on:
+  # Recommended release method:
+  # git tag v1.0.0
+  # git push origin v1.0.0
   push:
     tags:
       - "v*"
 
+  # Allows rebuilding/publishing from GitHub Actions manually.
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Existing tag to rebuild and publish"
+      release_tag:
+        description: "Release tag, for example v1.0.0 or v1.0.0-rc.11"
         required: true
+        type: string
+
+      source_ref:
+        description: "Git branch or commit to build from"
+        required: true
+        default: "main"
         type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: plexo-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: plexo-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
+
 jobs:
+
+  # ============================================================
+  # BUILD
+  # ============================================================
+
   build:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
+
       matrix:
         include:
+
+          # ------------------------------------------------------
+          # Windows
+          # ------------------------------------------------------
           - platform: Windows
             os: windows-latest
             target: win
-            artifact: plexo-windows
+            artifact_name: plexo-windows
+            output_dir: release/windows
 
+          # ------------------------------------------------------
+          # macOS
+          # ------------------------------------------------------
           - platform: macOS
             os: macos-latest
             target: mac
-            artifact: plexo-macos
+            artifact_name: plexo-macos
+            output_dir: release/macos
 
+          # ------------------------------------------------------
+          # Linux
+          # ------------------------------------------------------
           - platform: Linux
             os: ubuntu-latest
             target: linux
-            artifact: plexo-linux
+            artifact_name: plexo-linux
+            output_dir: release/linux
+
 
     steps:
+
+      # ----------------------------------------------------------
+      # Checkout
+      # ----------------------------------------------------------
+
       - name: Checkout source
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
+          fetch-depth: 0
+
+
+      # ----------------------------------------------------------
+      # Node.js
+      # ----------------------------------------------------------
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "22.12.0"
           cache: npm
+
+
+      # ----------------------------------------------------------
+      # Install dependencies
+      # ----------------------------------------------------------
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Build Plexo
-        run: npm run build:${{ matrix.target }}
 
-      - name: Show build output
+      # ----------------------------------------------------------
+      # Check version
+      # ----------------------------------------------------------
+
+      - name: Validate package version
         shell: bash
         run: |
-          echo "===== dist/ ====="
-          find dist -maxdepth 2 -type f -print 2>/dev/null || true
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
 
-      - name: Upload platform build
+          echo "Package version: ${PACKAGE_VERSION}"
+
+          if [ -z "${PACKAGE_VERSION}" ]; then
+            echo "Could not determine package version."
+            exit 1
+          fi
+
+          echo "PACKAGE_VERSION=${PACKAGE_VERSION}" >> "$GITHUB_ENV"
+
+
+      # ----------------------------------------------------------
+      # Clean old build output
+      # ----------------------------------------------------------
+
+      - name: Clean build directories
+        shell: bash
+        run: |
+          rm -rf dist
+          rm -rf release
+
+          mkdir -p "${{ matrix.output_dir }}"
+
+
+      # ----------------------------------------------------------
+      # Build platform
+      # ----------------------------------------------------------
+
+      - name: Build ${{ matrix.platform }}
+        run: npm run build:${{ matrix.target }}
+
+
+      # ----------------------------------------------------------
+      # Collect ONLY distributable files
+      #
+      # IMPORTANT:
+      # Do not upload the unpacked Electron directories.
+      # The previous workflow uploaded things such as:
+      #
+      #   win-unpacked/
+      #   win-arm64-unpacked/
+      #   mac/
+      #   mac-arm64/
+      #   linux-unpacked/
+      #   linux-arm64-unpacked/
+      #
+      # Those are development/build directories, not release assets.
+      # ----------------------------------------------------------
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "Build output"
+          echo "========================================"
+
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort || true
+
+          echo
+          echo "========================================"
+          echo "Collecting distributables"
+          echo "========================================"
+
+          find dist \
+            -maxdepth 1 \
+            -type f \
+            \( \
+              -name "*.exe" \
+              -o -name "*.exe.blockmap" \
+              -o -name "*.msi" \
+              -o -name "*.msi.blockmap" \
+              -o -name "*.appx" \
+              -o -name "*.appx.blockmap" \
+              -o -name "*.dmg" \
+              -o -name "*.dmg.blockmap" \
+              -o -name "*.pkg" \
+              -o -name "*.zip" \
+              -o -name "*.zip.blockmap" \
+              -o -name "*.7z" \
+              -o -name "*.7z.blockmap" \
+              -o -name "*.AppImage" \
+              -o -name "*.deb" \
+              -o -name "*.rpm" \
+              -o -name "*.snap" \
+              -o -name "*.pacman" \
+              -o -name "*.apk" \
+              -o -name "*.p5p" \
+              -o -name "*.tar.gz" \
+              -o -name "*.tar.xz" \
+              -o -name "*.tar.bz2" \
+              -o -name "*.tar.zst" \
+              -o -name "*.blockmap" \
+              -o -name "*.yml" \
+            \) \
+            ! -name "builder-debug.yml" \
+            ! -name "builder-effective-config.yaml" \
+            -exec cp {} "${{ matrix.output_dir }}/" \;
+
+
+      # ----------------------------------------------------------
+      # Verify release assets
+      # ----------------------------------------------------------
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "Release assets for ${{ matrix.platform }}"
+          echo "========================================"
+
+          find "${{ matrix.output_dir }}" \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f\n' \
+            | sort
+
+          COUNT=$(find "${{ matrix.output_dir }}" -maxdepth 1 -type f | wc -l)
+
+          echo
+          echo "Asset count: ${COUNT}"
+
+          if [ "${COUNT}" -eq 0 ]; then
+            echo
+            echo "ERROR: No distributable release assets were found."
+            echo
+            echo "Full dist directory:"
+            find dist -maxdepth 2 -type f -print
+            exit 1
+          fi
+
+
+      # ----------------------------------------------------------
+      # Upload clean platform artifact
+      # ----------------------------------------------------------
+
+      - name: Upload ${{ matrix.platform }} release
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/**
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.output_dir }}
           if-no-files-found: error
           compression-level: 0
+          retention-days: 3
 
+
+  # ============================================================
+  # RELEASE
+  # ============================================================
 
   release:
-    name: Create GitHub Release
+    name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download all platform builds
-        uses: actions/download-artifact@v8
+
+      # ----------------------------------------------------------
+      # Checkout repository
+      #
+      # This fixes:
+      # fatal: not a git repository
+      # ----------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
         with:
-          pattern: plexo-*
-          path: release-assets
-          merge-multiple: true
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
+          fetch-depth: 0
 
-      - name: Show release files
+
+      # ----------------------------------------------------------
+      # Determine release tag
+      # ----------------------------------------------------------
+
+      - name: Determine release tag
+        id: release
         shell: bash
         run: |
-          echo "===== Release assets ====="
-          find release-assets -type f -print
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        shell: bash
-        run: |
-          mapfile -t ASSETS < <(
-            find release-assets \
-              -type f \
-              -not -name ".DS_Store" \
-              -print
-          )
+          echo "Release tag: ${TAG}"
 
-          if [ "${#ASSETS[@]}" -eq 0 ]; then
-            echo "No release assets found."
+          if [ -z "${TAG}" ]; then
+            echo "ERROR: Release tag is empty."
             exit 1
           fi
 
-          echo "Creating release: ${TAG}"
+          case "${TAG}" in
+            v*)
+              ;;
+            *)
+              echo "ERROR: Release tag must start with 'v'."
+              echo "Example: v1.0.0 or v1.0.0-rc.11"
+              exit 1
+              ;;
+          esac
 
-          gh release create "${TAG}" \
-            "${ASSETS[@]}" \
-            --title "Plexo ${TAG}" \
+          VERSION="${TAG#v}"
+
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].+)?$ ]]; then
+            echo "ERROR: Invalid semantic version tag: ${TAG}"
+            echo "Example: v1.0.0 or v1.0.0-rc.11"
+            exit 1
+          fi
+
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+
+          echo "Package version: ${PACKAGE_VERSION}"
+          echo "Release version: ${VERSION}"
+
+          if [ "${PACKAGE_VERSION}" != "${VERSION}" ]; then
+            echo
+            echo "ERROR: Release tag does not match package.json."
+            echo
+            echo "package.json: ${PACKAGE_VERSION}"
+            echo "release tag:   ${VERSION}"
+            echo
+            echo "Update package.json first or use the matching tag."
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+
+      # ----------------------------------------------------------
+      # Download Windows artifact
+      # ----------------------------------------------------------
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: plexo-windows
+          path: downloaded/windows
+
+
+      # ----------------------------------------------------------
+      # Download macOS artifact
+      # ----------------------------------------------------------
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: plexo-macos
+          path: downloaded/macos
+
+
+      # ----------------------------------------------------------
+      # Download Linux artifact
+      # ----------------------------------------------------------
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: plexo-linux
+          path: downloaded/linux
+
+
+      # ----------------------------------------------------------
+      # Prepare final release directory
+      # ----------------------------------------------------------
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          rm -rf upload
+          mkdir -p upload
+
+          echo "========================================"
+          echo "Downloaded Windows"
+          echo "========================================"
+
+          find downloaded/windows \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f\n' \
+            | sort || true
+
+          echo
+          echo "========================================"
+          echo "Downloaded macOS"
+          echo "========================================"
+
+          find downloaded/macos \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f\n' \
+            | sort || true
+
+          echo
+          echo "========================================"
+          echo "Downloaded Linux"
+          echo "========================================"
+
+          find downloaded/linux \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f\n' \
+            | sort || true
+
+          echo
+          echo "========================================"
+          echo "Copying release files"
+          echo "========================================"
+
+          find downloaded \
+            -type f \
+            \( \
+              -name "*.exe" \
+              -o -name "*.exe.blockmap" \
+              -o -name "*.msi" \
+              -o -name "*.msi.blockmap" \
+              -o -name "*.appx" \
+              -o -name "*.appx.blockmap" \
+              -o -name "*.dmg" \
+              -o -name "*.dmg.blockmap" \
+              -o -name "*.pkg" \
+              -o -name "*.zip" \
+              -o -name "*.zip.blockmap" \
+              -o -name "*.7z" \
+              -o -name "*.7z.blockmap" \
+              -o -name "*.AppImage" \
+              -o -name "*.deb" \
+              -o -name "*.rpm" \
+              -o -name "*.snap" \
+              -o -name "*.pacman" \
+              -o -name "*.apk" \
+              -o -name "*.p5p" \
+              -o -name "*.tar.gz" \
+              -o -name "*.tar.xz" \
+              -o -name "*.tar.bz2" \
+              -o -name "*.tar.zst" \
+              -o -name "*.blockmap" \
+              -o -name "*.yml" \
+            \) \
+            ! -name "builder-debug.yml" \
+            ! -name "builder-effective-config.yaml" \
+            -exec cp {} upload/ \;
+
+          echo
+          echo "========================================"
+          echo "Final GitHub Release assets"
+          echo "========================================"
+
+          find upload \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f\n' \
+            | sort
+
+          COUNT=$(find upload -maxdepth 1 -type f | wc -l)
+
+          echo
+          echo "Final asset count: ${COUNT}"
+
+          if [ "${COUNT}" -eq 0 ]; then
+            echo "ERROR: No release assets found."
+            exit 1
+          fi
+
+
+      # ----------------------------------------------------------
+      # Detect prerelease
+      # ----------------------------------------------------------
+
+      - name: Determine release type
+        id: release_type
+        shell: bash
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+
+          if [[ "${TAG}" =~ -(alpha|beta|rc)(\.|-|$) ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "This is a prerelease."
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "This is a stable release."
+          fi
+
+
+      # ----------------------------------------------------------
+      # Show final files and sizes
+      # ----------------------------------------------------------
+
+      - name: Generate asset report
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "Release asset report"
+          echo "========================================"
+
+          find upload \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f\t%k KB\n' \
+            | sort
+
+
+      # ----------------------------------------------------------
+      # Create / update GitHub Release
+      # ----------------------------------------------------------
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          echo "Creating/updating release: ${TAG}"
+
+          RELEASE_ARGS=(
+            "${TAG}"
+            --repo "ProAlit/plexo"
+            --title "Plexo ${TAG}"
             --generate-notes
+          )
+
+          if [ "${{ steps.release_type.outputs.prerelease }}" = "true" ]; then
+            RELEASE_ARGS+=(--prerelease)
+          fi
+
+          gh release view "${TAG}" --repo "ProAlit/plexo" >/dev/null 2>&1 || {
+            echo "Release does not exist yet."
+          }
+
+          gh release create \
+            "${RELEASE_ARGS[@]}" \
+            upload/*
+
+          echo
+          echo "========================================"
+          echo "Release published successfully"
+          echo "========================================"
+
+          echo "https://github.com/ProAlit/plexo/releases/tag/${TAG}"
